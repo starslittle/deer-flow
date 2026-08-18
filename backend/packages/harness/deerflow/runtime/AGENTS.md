@@ -1,3 +1,13 @@
+### Run Event Journal (`runtime/journal.py`)
+
+`LoopDetectionMiddleware` records each warning and hard stop as
+`middleware:loop_detection` when the worker exposes the run-scoped journal.
+The privacy-safe payload contains the detector, observed count, configured
+threshold, and tool names (plus `stop_reason=loop_capped` for hard stops), but
+not arguments, call IDs/hashes, or message content. Recording is best-effort
+and happens outside the middleware's tracking lock, so persistence failures
+never change Agent control flow.
+
 ### Checkpoint Channel Modes (`full` / `delta`)
 
 Checkpointer storage runs in one of two channel modes, selected by `checkpoint_channel_mode` in `config.yaml` (default `full`). `delta` mode adopts LangGraph 1.2's `DeltaChannel` for `messages`: checkpoints store a sentinel + per-step writes instead of the full message list, so storage/serde grows O(N) instead of O(N²) in turns. All checkpointer backends (memory/sqlite/postgres) serve both modes unchanged — the semantics live in the compiled graph's channel table, not in the saver.

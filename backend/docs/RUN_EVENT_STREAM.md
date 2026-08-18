@@ -76,10 +76,19 @@ through run-event or specialized APIs:
 | `context:memory` | `context` | `record_memory_context()` |
 | `middleware:{tag}` | `middleware` | `record_middleware()` |
 
-Current middleware tags are `guardrail`, `safety_termination`,
-`skill_activation`, and `skill_secrets`. The pattern is intentionally open so
-new middleware tags are additive. Because the full event type is limited to 32
-characters and `middleware:` uses 11, a tag must contain 1-21 characters.
+Current middleware tags are `guardrail`, `loop_detection`,
+`safety_termination`, `skill_activation`, and `skill_secrets`. The pattern is
+intentionally open so new middleware tags are additive. Because the full event
+type is limited to 32 characters and `middleware:` uses 11, a tag must contain
+1-21 characters.
+
+`LoopDetectionMiddleware` records both `warn` and `hard_stop` interventions as
+`middleware:loop_detection`. Its `changes` object identifies the triggering
+detector (`identical_tool_calls` or `tool_frequency`), observed count,
+configured threshold, and tool names; hard stops also include
+`stop_reason=loop_capped`. Tool arguments, call IDs, call hashes, and message
+content are deliberately excluded. Recording is best-effort and does not alter
+loop handling when the journal is absent or unavailable.
 
 ### Opaque Run Outputs
 
@@ -176,7 +185,6 @@ be used by new producers.
 - Nested non-JSON values in `run.end.content` have backend-dependent
   representations: memory retains Python values, while JSONL and database
   stores read them back as strings.
-- Loop detection and deferred-tool promotion do not currently emit middleware
-  events.
+- Deferred-tool promotion does not currently emit middleware events.
 - Journal attribution, token accounting, and external tracing metadata still
   depend on manual instrumentation at several LLM call sites.

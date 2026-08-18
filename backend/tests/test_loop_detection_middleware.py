@@ -652,6 +652,172 @@ class TestLoopDetection:
         assert "default" in mw._history
 
 
+class TestLoopDetectionAuditEvents:
+    """Persist privacy-safe evidence for every loop intervention."""
+
+    @staticmethod
+    def _journal_runtime():
+        runtime = _make_runtime()
+        journal = MagicMock()
+        runtime.context["__run_journal"] = journal
+        return runtime, journal
+
+    def test_identical_call_warning_records_audit_event_without_arguments(self):
+        mw = LoopDetectionMiddleware(
+            warn_threshold=2,
+            hard_limit=4,
+            tool_freq_warn=100,
+            tool_freq_hard_limit=200,
+        )
+        runtime, journal = self._journal_runtime()
+        call = [_bash_call("echo secret-token")]
+
+        mw._apply(_make_state(tool_calls=call), runtime)
+        result = mw._apply(_make_state(tool_calls=call), runtime)
+
+        assert result is None
+        journal.record_middleware.assert_called_once_with(
+            tag="loop_detection",
+            name="LoopDetectionMiddleware",
+            hook="after_model",
+            action="warn",
+            changes={
+                "detector": "identical_tool_calls",
+                "count": 2,
+                "threshold": 2,
+                "tool_names": ["bash"],
+            },
+        )
+        assert "secret-token" not in repr(journal.record_middleware.call_args)
+
+    def test_identical_call_hard_stop_records_audit_event(self):
+        mw = LoopDetectionMiddleware(
+            warn_threshold=2,
+            hard_limit=4,
+            tool_freq_warn=100,
+            tool_freq_hard_limit=200,
+        )
+        runtime, journal = self._journal_runtime()
+        call = [_bash_call("ls")]
+
+        for _ in range(3):
+            mw._apply(_make_state(tool_calls=call), runtime)
+        journal.reset_mock()
+
+        result = mw._apply(_make_state(tool_calls=call), runtime)
+
+        assert result is not None
+        journal.record_middleware.assert_called_once_with(
+            tag="loop_detection",
+            name="LoopDetectionMiddleware",
+            hook="after_model",
+            action="hard_stop",
+            changes={
+                "detector": "identical_tool_calls",
+                "count": 4,
+                "threshold": 4,
+                "tool_names": ["bash"],
+                "stop_reason": "loop_capped",
+            },
+        )
+
+    def test_tool_frequency_warning_records_triggering_tool(self):
+        mw = LoopDetectionMiddleware(
+            warn_threshold=100,
+            hard_limit=200,
+            tool_freq_warn=2,
+            tool_freq_hard_limit=4,
+        )
+        runtime, journal = self._journal_runtime()
+
+        mw._apply(_make_state(tool_calls=[_bash_call("pwd")]), runtime)
+        result = mw._apply(_make_state(tool_calls=[_bash_call("ls")]), runtime)
+
+        assert result is None
+        journal.record_middleware.assert_called_once_with(
+            tag="loop_detection",
+            name="LoopDetectionMiddleware",
+            hook="after_model",
+            action="warn",
+            changes={
+                "detector": "tool_frequency",
+                "count": 2,
+                "threshold": 2,
+                "tool_names": ["bash"],
+            },
+        )
+
+    def test_tool_frequency_hard_stop_records_audit_event(self):
+        mw = LoopDetectionMiddleware(
+            warn_threshold=100,
+            hard_limit=200,
+            tool_freq_warn=2,
+            tool_freq_hard_limit=4,
+        )
+        runtime, journal = self._journal_runtime()
+
+        for command in ("pwd", "ls", "whoami"):
+            mw._apply(_make_state(tool_calls=[_bash_call(command)]), runtime)
+        journal.reset_mock()
+
+        result = mw._apply(_make_state(tool_calls=[_bash_call("date")]), runtime)
+
+        assert result is not None
+        journal.record_middleware.assert_called_once_with(
+            tag="loop_detection",
+            name="LoopDetectionMiddleware",
+            hook="after_model",
+            action="hard_stop",
+            changes={
+                "detector": "tool_frequency",
+                "count": 4,
+                "threshold": 4,
+                "tool_names": ["bash"],
+                "stop_reason": "loop_capped",
+            },
+        )
+
+    def test_journal_failure_never_changes_warning_or_hard_stop_behavior(self):
+        mw = LoopDetectionMiddleware(
+            warn_threshold=1,
+            hard_limit=2,
+            tool_freq_warn=100,
+            tool_freq_hard_limit=200,
+        )
+        runtime, journal = self._journal_runtime()
+        journal.record_middleware.side_effect = RuntimeError("event store unavailable")
+        call = [_bash_call("ls")]
+
+        warning_result = mw._apply(_make_state(tool_calls=call), runtime)
+        hard_stop_result = mw._apply(_make_state(tool_calls=call), runtime)
+
+        assert warning_result is None
+        assert mw._pending_warnings[_pending_key()]
+        assert hard_stop_result is not None
+        assert hard_stop_result["messages"][0].tool_calls == []
+        assert mw.consume_stop_reason("test-run") == "loop_capped"
+        assert journal.record_middleware.call_count == 2
+
+    def test_audit_recording_runs_outside_tracking_lock(self):
+        mw = LoopDetectionMiddleware(
+            warn_threshold=1,
+            hard_limit=2,
+            tool_freq_warn=100,
+            tool_freq_hard_limit=200,
+        )
+        runtime, journal = self._journal_runtime()
+
+        def assert_lock_is_available(**_kwargs):
+            assert mw._lock.acquire(blocking=False)
+            mw._lock.release()
+
+        journal.record_middleware.side_effect = assert_lock_is_available
+
+        mw._apply(_make_state(tool_calls=[_bash_call("ls")]), runtime)
+
+        journal.record_middleware.assert_called_once()
+
+
 class TestLoopDetectionAgentGraphIntegration:
     def test_loop_warning_is_transient_in_real_agent_graph(self):
         """after_model queues the warning; wrap_model_call injects it request-only."""

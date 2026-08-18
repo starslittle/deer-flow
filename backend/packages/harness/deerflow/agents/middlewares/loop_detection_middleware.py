@@ -47,6 +47,14 @@ Stop-reason surfacing (#3875 Phase 2):
   the token-budget guard's so a loop-capped run surfaces as
   ``completed + loop_capped`` and the lead/ledger can tell it was capped
   without parsing result text.
+
+Run-event audit:
+  Every warning and hard stop best-effort records a
+  ``middleware:loop_detection`` event when the run exposes a journal. The
+  payload identifies the detector, threshold, count, and tool names, but
+  deliberately excludes tool arguments, call ids, hashes, and message content.
+  Persistence happens outside the tracking lock and can never block the
+  intervention itself.
 """
 
 from __future__ import annotations
@@ -58,7 +66,8 @@ import threading
 from collections import Counter, OrderedDict, defaultdict, deque
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
-from typing import TYPE_CHECKING, override
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Literal, override
 
 from langchain.agents import AgentState
 from langchain.agents.middleware import AgentMiddleware
@@ -67,6 +76,7 @@ from langchain_core.messages import HumanMessage
 from langgraph.runtime import Runtime
 
 from deerflow.agents.middlewares._bounded_dict import BoundedDict
+from deerflow.runtime.events.catalog import MIDDLEWARE_LOOP_DETECTION_TAG
 
 if TYPE_CHECKING:
     from deerflow.config.loop_detection_config import LoopDetectionConfig
@@ -182,6 +192,27 @@ _TOOL_FREQ_WARNING_MSG = (
 _HARD_STOP_MSG = "[FORCED STOP] Repeated tool calls exceeded the safety limit. Producing final answer with results collected so far."
 
 _TOOL_FREQ_HARD_STOP_MSG = "[FORCED STOP] Tool {tool_name} called {count} times — exceeded the per-tool safety limit. Producing final answer with results collected so far."
+
+
+@dataclass(frozen=True, slots=True)
+class _LoopIntervention:
+    """Structured evidence for one warning or hard-stop decision."""
+
+    message: str
+    action: Literal["warn", "hard_stop"]
+    detector: Literal["identical_tool_calls", "tool_frequency"]
+    count: int
+    threshold: int
+    tool_names: tuple[str, ...]
+
+    @property
+    def hard_stop(self) -> bool:
+        return self.action == "hard_stop"
+
+
+def _audit_tool_names(tool_calls: list[dict]) -> tuple[str, ...]:
+    """Return deterministic tool names without retaining arguments or ids."""
+    return tuple(sorted({str(tool_call.get("name") or "unknown") for tool_call in tool_calls}))
 
 
 class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
@@ -405,7 +436,7 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
             self._touch_pending_warning_key_locked(pending_key)
             self._prune_pending_warning_state_locked(protected_key=pending_key)
 
-    def _track_and_check(self, state: AgentState, runtime: Runtime) -> tuple[str | None, bool]:
+    def _track_and_check(self, state: AgentState, runtime: Runtime) -> _LoopIntervention | None:
         """Track tool calls and check for loops.
 
         Two detection layers:
@@ -415,22 +446,24 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
              on 40 different files).
 
         Returns:
-            (warning_message_or_none, should_hard_stop)
+            Structured intervention evidence when a detector crosses a warning
+            or hard-stop threshold, otherwise ``None``.
         """
         messages = state.get("messages", [])
         if not messages:
-            return None, False
+            return None
 
         last_msg = messages[-1]
         if getattr(last_msg, "type", None) != "ai":
-            return None, False
+            return None
 
         tool_calls = getattr(last_msg, "tool_calls", None)
         if not tool_calls:
-            return None, False
+            return None
 
         thread_id = self._get_thread_id(runtime)
         call_hash = _hash_tool_calls(tool_calls)
+        audit_tool_names = _audit_tool_names(tool_calls)
 
         with self._lock:
             # Touch / create entry (move to end for LRU)
@@ -465,7 +498,14 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
                         "tools": tool_names,
                     },
                 )
-                return _HARD_STOP_MSG, True
+                return _LoopIntervention(
+                    message=_HARD_STOP_MSG,
+                    action="hard_stop",
+                    detector="identical_tool_calls",
+                    count=count,
+                    threshold=self.hard_limit,
+                    tool_names=audit_tool_names,
+                )
 
             if count >= self.warn_threshold:
                 warned = self._warned[thread_id]
@@ -480,7 +520,14 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
                             "tools": tool_names,
                         },
                     )
-                    return _WARNING_MSG, False
+                    return _LoopIntervention(
+                        message=_WARNING_MSG,
+                        action="warn",
+                        detector="identical_tool_calls",
+                        count=count,
+                        threshold=self.warn_threshold,
+                        tool_names=audit_tool_names,
+                    )
 
             # --- Layer 2: per-tool-type frequency (windowed) ---
             tool_name_history = self._tool_name_history[thread_id]
@@ -519,7 +566,14 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
                             "count": freq_count,
                         },
                     )
-                    return _TOOL_FREQ_HARD_STOP_MSG.format(tool_name=name, count=freq_count), True
+                    return _LoopIntervention(
+                        message=_TOOL_FREQ_HARD_STOP_MSG.format(tool_name=name, count=freq_count),
+                        action="hard_stop",
+                        detector="tool_frequency",
+                        count=freq_count,
+                        threshold=eff_hard,
+                        tool_names=(str(name),),
+                    )
 
                 if freq_count >= eff_warn:
                     freq_warned = self._tool_freq_warned[thread_id]
@@ -533,13 +587,20 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
                                 "count": freq_count,
                             },
                         )
-                        return _TOOL_FREQ_WARNING_MSG.format(tool_name=name, count=freq_count), False
+                        return _LoopIntervention(
+                            message=_TOOL_FREQ_WARNING_MSG.format(tool_name=name, count=freq_count),
+                            action="warn",
+                            detector="tool_frequency",
+                            count=freq_count,
+                            threshold=eff_warn,
+                            tool_names=(str(name),),
+                        )
                 else:
                     # Windowed count decayed below the warn threshold; allow a
                     # future burst of this tool to warn again.
                     self._tool_freq_warned[thread_id].discard(name)
 
-        return None, False
+        return None
 
     @staticmethod
     def _append_text(content: str | list | None, text: str) -> str | list:
@@ -578,10 +639,40 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
 
         return update
 
-    def _apply(self, state: AgentState, runtime: Runtime) -> dict | None:
-        warning, hard_stop = self._track_and_check(state, runtime)
+    def _record_audit_event(self, intervention: _LoopIntervention, runtime: Runtime) -> None:
+        """Persist privacy-safe loop intervention evidence when a journal exists."""
+        context = getattr(runtime, "context", None)
+        journal = context.get("__run_journal") if isinstance(context, dict) else None
+        if journal is None:
+            return
 
-        if hard_stop:
+        changes = {
+            "detector": intervention.detector,
+            "count": intervention.count,
+            "threshold": intervention.threshold,
+            "tool_names": list(intervention.tool_names),
+        }
+        if intervention.hard_stop:
+            changes["stop_reason"] = "loop_capped"
+
+        try:
+            journal.record_middleware(
+                tag=MIDDLEWARE_LOOP_DETECTION_TAG,
+                name=type(self).__name__,
+                hook="after_model",
+                action=intervention.action,
+                changes=changes,
+            )
+        except Exception:  # noqa: BLE001
+            # Observability is best-effort and must never change agent control flow.
+            logger.warning("Failed to record middleware:loop_detection event", exc_info=True)
+
+    def _apply(self, state: AgentState, runtime: Runtime) -> dict | None:
+        intervention = self._track_and_check(state, runtime)
+        if intervention is None:
+            return None
+
+        if intervention.hard_stop:
             # Record the stop reason so the executor can surface
             # ``stop_reason=loop_capped`` after the run returns (#3875 Phase 2).
             # The hard stop does not raise — it strips tool_calls and lets the
@@ -604,21 +695,20 @@ class LoopDetectionMiddleware(AgentMiddleware[AgentState]):
             # is safe for OpenAI/Moonshot pairing validators.
             messages = state.get("messages", [])
             last_msg = messages[-1]
-            content = self._append_text(last_msg.content, warning or _HARD_STOP_MSG)
+            content = self._append_text(last_msg.content, intervention.message)
             stripped_msg = last_msg.model_copy(update=self._build_hard_stop_update(last_msg, content))
+            self._record_audit_event(intervention, runtime)
             return {"messages": [stripped_msg]}
 
-        if warning:
-            # Defer injection to the next model call. We must NOT alter the
-            # AIMessage(tool_calls=...) here (would put framework words in
-            # the model's mouth, polluting downstream consumers like
-            # MemoryMiddleware), nor insert a separate non-tool message
-            # (would break OpenAI/Moonshot tool-call pairing because the
-            # tools node has not produced ToolMessage responses yet). The
-            # warning is delivered via ``wrap_model_call`` below.
-            self._queue_pending_warning(runtime, warning)
-            return None
-
+        # Defer injection to the next model call. We must NOT alter the
+        # AIMessage(tool_calls=...) here (would put framework words in
+        # the model's mouth, polluting downstream consumers like
+        # MemoryMiddleware), nor insert a separate non-tool message
+        # (would break OpenAI/Moonshot tool-call pairing because the
+        # tools node has not produced ToolMessage responses yet). The
+        # warning is delivered via ``wrap_model_call`` below.
+        self._queue_pending_warning(runtime, intervention.message)
+        self._record_audit_event(intervention, runtime)
         return None
 
     def _clear_other_run_pending_warnings(self, runtime: Runtime) -> None:
